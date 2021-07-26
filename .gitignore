@@ -1,0 +1,6 @@
+*.Rproj
+*.pdf
+.Rproj.user
+.Rhistory
+.RData
+*~

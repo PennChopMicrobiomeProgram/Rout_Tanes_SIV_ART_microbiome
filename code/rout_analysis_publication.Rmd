@@ -1,0 +1,1048 @@
+---
+title: "Inflammaging monkeys shotgun analysis"
+author: "Ceylan Tanes - PennCHOP Microbiome Program"
+date: \today
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=6,
+  fig.height=4,
+  fig.align = "center"
+  )
+```
+
+
+```{r import libraries, message=F, warning=F}
+library(pheatmap)
+library(ggplot2)
+library(RColorBrewer)
+library(viridis)
+
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(reshape2)
+library(broom)
+library(tibble)
+
+library(pander)
+library(qiimer)
+library(vegan)
+library(ape)
+
+library(kylemisc)
+library(usedist)
+library(nlme)
+library(emmeans) # for lmer post-hoc tests
+```
+
+```{r}
+tidy_lmer2 <- function(lmer_test, term_string) {
+  mod <- anova(lmer_test)
+  form_pairwise <- as.formula(paste0("pairwise~", term_string))
+  bind_rows(data.frame(contrast = rownames(mod), mod, row.names=NULL),
+            data.frame(emmeans(lmer_test, list(form_pairwise), adjust="tukey")[[2]])) %>%
+    #mutate(AIC = AIC(lmer_test)) %>%
+    select(contrast, p.value, everything())
+}
+
+tidy_lmer <- function(lmer_test) {
+  mod <- summary(lmer_test)
+  data.frame(term  = rownames(mod$tTable), mod$tTable, row.names=NULL)
+}
+
+tidy_permanova <- function(anov){
+  data.frame(Term = rownames(anov$aov.tab), anov$aov.tab, row.names = NULL) %>%
+    rename(p.value = Pr..F.)
+}
+```
+
+
+```{r}
+data_dir <- "../data"
+
+### mapping file path
+mapping_file_fp <- file.path(data_dir, "rout_metadata_final.tsv")
+
+### taxonomic assignment 
+feature_table_fp <- file.path(data_dir, "rout_kraken_final.tsv")
+
+### cytokine data
+cytokine_file_fp <- file.path(data_dir, "rout_cytokine_data.tsv")
+
+### butyrate data
+butyrate_file_fp <- file.path(data_dir, "rout_butyrate.tsv")
+
+perm <- 99
+```
+
+
+```{r}
+s <- read.delim(mapping_file_fp, sep='\t') %>%
+  mutate(SampleID = as.character(SampleID)) 
+cytokine_data <- read.delim(cytokine_file_fp, sep='\t')
+```
+
+
+```{r}
+o <- read_qiime_otu_table(feature_table_fp)
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", o$metadata, perl=T)
+md <- gsub("[kpcofgs]__", "", md)  
+
+# Assignments data-frame
+adf <- split_assignments(md) %>%
+  mutate(Species = ifelse(!is.na(Genus) & !is.na(Species), paste(Genus, Species), NA))
+a <- simplify_assignments(adf, rank1 = "Phylum", rank2="Species")
+
+cts <- o$counts
+colnames(cts) <- sub("\\.taxa$", "", colnames(cts))
+
+
+is_human <- grepl("Chordata", adf$Phylum)
+adf <- adf[!is_human,]
+a <- a[!is_human]
+cts <- cts[!is_human,]
+
+cts_props <- sweep(cts, 2, colSums(cts), "/")
+summed_cts <- rowsum(cts, a) 
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+a_f <- simplify_assignments(adf, rank1="Phylum", rank2="Family")
+summed_cts_f <- rowsum(cts, a_f) 
+summed_props_f <- sweep(summed_cts_f, 2, colSums(summed_cts_f), "/")
+
+s <- merge(s, data.frame(otu_counts= colSums(summed_cts)), by.x="SampleID", by.y="row.names", all.x=T)
+
+```
+
+
+```{r alpha}
+s <- s %>%
+  merge(diversity(t(cts)), by.x="SampleID", by.y="row.names", all.x=T) %>%
+  dplyr::rename(shannon = y) %>%
+  merge(rarefy(t(cts), 1000), by.x="SampleID", by.y="row.names", all.x=T) %>%
+  dplyr::rename(richness = y) 
+```
+
+```{r beta}
+bc <- vegdist(t(summed_props))
+jd <- vegdist(t(summed_props), binary = T)
+
+```
+
+
+# Longitudinal analysis of microbiome
+
+```{r}
+s_toTest <- s %>%
+  filter(study_group != "pre.d0") %>% ## take out the time point when the monkeys were taken out of colony
+  droplevels() %>%
+  
+  mutate(study_day = factor(study_day, levels=c("d0", "d35", "3mo", "8mo", "1yr", "21mo"))) %>%
+  mutate(study_group = interaction(study_group_simple, study_day)) %>%
+  droplevels() %>%
+  
+  mutate(study_group_linear = factor(study_group, ordered=T)) %>%
+  mutate(study_group_label = fct_relabel(study_group, function(x) gsub("\\.", "\n", x)))
+
+pander(table(s_toTest$SubjectID, s_toTest$study_group), split.table=Inf, digits=2)
+
+ann_colors <- list(
+  study_group = setNames(viridis(6, end=0.8), levels(s_toTest$study_group)),
+  study_group_spaces = setNames(viridis(6, end=0.8), gsub("\\.", " ", levels(s_toTest$study_group))),
+  study_group_label = setNames(viridis(6, end=0.8), levels(s_toTest$study_group_label)),
+  SubjectID = setNames(brewer.pal(6, "Set2"), unique(s_toTest$SubjectID))
+)
+```
+
+
+
+## Line plot (family level)
+
+```{r fig.height=8, fig.width=10}
+summed_props_f %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  merge(s_toTest, by="SampleID") %>%
+  mutate(Taxa2 = fct_lump(Taxa, 8, w=props)) %>%
+  mutate(Taxa2 = reorder(Taxa2, -props)) %>%
+  mutate(Taxa2 = fct_relevel(Taxa2, "Other", after=Inf)) %>%
+  mutate(Taxa2 = fct_relabel(Taxa2, function(x) sub(" ", "\n", x))) %>%
+  
+  group_by(SubjectID, study_group_label, Taxa2) %>%
+  summarize(props = sum(props)) %>%
+  ungroup() %>%
+  
+  ggplot(aes(x=study_group_label, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_line(aes(group=SubjectID, color=SubjectID)) +
+    geom_point(aes(color=SubjectID)) +
+    facet_wrap(~Taxa2, scales = "free", ncol=4) +
+    scale_color_manual(values=ann_colors$SubjectID) +
+    scale_y_continuous(labels=scales:::percent) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      aspect.ratio = 1
+    ) +
+    guides(color=F) +
+    labs(
+      x="", color="", 
+      y="Relative abundance"
+    )
+
+
+#ggsave("Fig3_linePlot_family.pdf", height=8, width=10, useDingbats=F)
+```
+
+
+
+## Alpha diversity
+
+```{r fig.width=6}
+s_toTest %>%
+  gather("metric", "alpha", c("richness", "shannon")) %>%
+  mutate(metric = fct_recode(metric, Richness="richness", `Shannon diversity`="shannon")) %>%
+  
+  ggplot(aes(x=study_group_label, y=alpha)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_line(aes(group=SubjectID, color=SubjectID)) +
+    geom_point(aes(color=SubjectID)) +
+    facet_wrap(~metric, scales = "free_y") +
+    scale_color_manual(values=ann_colors$SubjectID) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      aspect.ratio = 1
+    ) +
+    guides(color=F) +
+    labs(
+      x="", color="SubjectID", 
+      y="Alpha diversity value"
+    )
+
+#ggsave("Fig4A_alphaDiversity.pdf", height=3, width=5, useDingbats=F)
+```
+
+
+Linear mixed effects models were used to estimate the change in alpha diversity for the study groups. The general study group term is tested first followed by post-hoc tests. The results with p<0.05 are shown in bold.
+
+```{r}
+s_toTest %>%
+  gather("metric", "alpha", c("richness", "shannon")) %>%
+  mutate(metric = fct_recode(metric, Richness="richness", Shannon="shannon")) %>%
+  group_by(metric) %>%
+  do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|SubjectID, data=., na.action=na.omit), "study_group")) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", contrast)) %>%
+  #mutate(term = sub("study_group", "Pre - ", term)) %>%
+  #mutate(term = sub("Diet", "Whole food - ", term)) %>%
+  pander(split.table=Inf, digits=2)#, emphasize.strong.rows = which(.$p.value<=0.05))
+```
+
+## Beta diversity
+
+
+Here, we use Bray-Curtis and Jaccard distances to compare the species composition of the samples to each other.
+
+The plots below show the distance between each pair of samples in a single 2D plot.  It is not possible to plot the distances exactly on paper, so we have used a method of ordination called Principal Coordinates Analysis to select the best coordinate system for display.  The percentage of total variance captured along each axis is displayed on the chart.
+
+
+
+```{r fig.show='hold', out.width='.49\\linewidth', fig.height=3, fig.width=5}
+dist_toTest <- dist_subset(jd, s_toTest$SampleID)
+pc <- pcoa(dist_toTest)
+pc_df <- merge(s_toTest, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names")
+pct <- round(pc$values$Relative_eig * 100)
+
+pc_df %>%
+  mutate(study_group = gsub("\\.", " ", study_group)) %>%
+  ggplot(aes(x=Axis.1, y=Axis.2, color=study_group)) +
+    geom_point() +
+    #stat_ellipse() +
+    scale_color_manual(values=ann_colors$study_group_spaces) +
+    #scale_shape_manual(values=c(19,1,17,2)) + 
+    theme_bw() +
+    theme(
+      axis.text=element_blank(),
+      axis.ticks=element_blank(),
+      panel.grid = element_blank(), 
+      aspect.ratio = 1,
+      strip.background = element_blank()
+    ) + 
+    labs(x=paste0("PCoA axis 1 (", pct[1], "%)"), 
+         y=paste0("PCoA axis 2 (", pct[2], "%)"),
+         color="Study\ngroup", shape="", lty ="", title="Jaccard")
+#ggsave("Fig4B_PcoA_Jaccard.pdf", height = 2.5, width=4, useDingbats=F)
+
+
+dist_toTest <- dist_subset(bc, s_toTest$SampleID)
+pc <- pcoa(dist_toTest)
+pc_df <- merge(s_toTest, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names")
+pct <- round(pc$values$Relative_eig * 100)
+
+pc_df %>%
+  mutate(study_group = gsub("\\.", " ", study_group)) %>%
+  ggplot(aes(x=Axis.1, y=Axis.2, color=study_group)) +
+    geom_point() +
+    #stat_ellipse() +
+    scale_color_manual(values=ann_colors$study_group_spaces) +
+    #scale_shape_manual(values=c(19,1,17,2)) + 
+    theme_bw() +
+    theme(
+      axis.text=element_blank(),
+      axis.ticks=element_blank(),
+      panel.grid = element_blank(), 
+      aspect.ratio = 1,
+      strip.background = element_blank()
+    ) + 
+    labs(x=paste0("PCoA axis 1 (", pct[1], "%)"), 
+         y=paste0("PCoA axis 2 (", pct[2], "%)"),
+         color="Study\ngroup", shape="", lty ="", title="Bray-Curtis")
+
+#ggsave("Fig4B_PcoA_BrayCurtis.pdf", height = 2.5, width=4, useDingbats=F)
+
+```
+
+
+PERMANOVA test was used on Bray-Curtis and Jaccard distances to estimate if the study group centroids can be distinguished from each other.
+
+```{r}
+set.seed(42)
+dist_toTest <- dist_subset(bc, s_toTest$SampleID)
+a_ixn_bc <- tidy_permanova(adonis(dist_subset(dist_toTest, s_toTest$SampleID) ~ study_group, data=s_toTest, permutations=perm, strata=as.character(s_toTest$SubjectID))) %>%
+  mutate(contrast = "study_group")
+
+combs <- combn(unique(s_toTest$study_group), 2)
+num_tests <- dim(combs)[2]
+
+# do post hoc tests
+for (i in 1:num_tests) {
+  s_temp <- s_toTest %>%
+    filter(study_group %in% combs[,i])
+  a_temp <- tidy_permanova(adonis(dist_subset(dist_toTest, s_temp$SampleID) ~ study_group, data=s_temp, permutations=perm, strata=as.character(s_temp$SubjectID))) %>%
+    mutate(contrast = paste(combs[,i], collapse=' - '))
+  a_ixn_bc <- rbind(a_ixn_bc, a_temp)
+}
+a_ixn_bc <- mutate(a_ixn_bc, distance="Bray-Curtis")
+
+
+set.seed(42)
+dist_toTest <- dist_subset(jd, s_toTest$SampleID)
+a_ixn_jd <- tidy_permanova(adonis(dist_subset(dist_toTest, s_toTest$SampleID) ~ study_group, data=s_toTest, permutations=perm, strata=as.character(s_toTest$SubjectID))) %>%
+  mutate(contrast = "study_group")
+
+
+combs <- combn(unique(s_toTest$study_group), 2)
+num_tests <- dim(combs)[2]
+
+# do post hoc tests
+for (i in 1:num_tests) {
+  s_temp <- s_toTest %>%
+    filter(study_group %in% combs[,i])
+  a_temp <- tidy_permanova(adonis(dist_subset(dist_toTest, s_temp$SampleID) ~ study_group, data=s_temp, permutations=perm, strata=as.character(s_temp$SubjectID))) %>%
+    mutate(contrast = paste(combs[,i], collapse=' - '))
+  a_ixn_jd <- rbind(a_ixn_jd, a_temp)
+}
+a_ixn_jd <- mutate(a_ixn_jd, distance="Jaccard")
+
+
+ rbind(a_ixn_bc, a_ixn_jd) %>%
+  filter(!Term %in% c("Residuals", "Total")) %>%
+  select(distance, contrast, Df, SumsOfSqs, R2, p.value) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$p.value<=0.05))
+
+```
+
+
+
+## Differential abundance: Species level
+
+
+Species with >0.5% relative abundance across all samples are visualized. 
+
+```{r}
+props_toTest <- summed_props[, s_toTest$SampleID] %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  group_by(Taxa) %>%
+  mutate(perc_present = sum(props > 0)/n()) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  filter(mean_prop > 0.005) %>%
+  filter(Taxa != "Bacteria")
+```
+
+
+
+Linear mixed effects models were used on logit transformed relative abundances to estimate the difference between study groups. The general study group term is tested first followed by post-hoc tests. Multiple tests have been corrected for false discovery rate using the Benjamini-Hochberg method. 
+
+```{r}
+form1 <- "props_logit ~ study_group"
+
+summaries_df <- props_toTest %>%
+  mutate(props = props + min(filter(props_toTest, props>0)$props) / 10) %>%
+  merge(s_toTest, by="SampleID") %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(Taxa) %>%
+  do(tidy_lmer2(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit), "study_group")) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", contrast)) %>%
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) 
+
+
+summaries_df %>%
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  select(Taxa, contrast, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2)#, emphasize.strong.rows = which(summaries_df$fdr<0.05))
+
+
+```
+
+
+
+The same test was repeated with ordered factors to determine linear increase across the study groups (pre < SIV < SIV.ART).
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- props_toTest %>%
+  mutate(props = props + min(filter(props_toTest, props>0)$props) / 10) %>%
+  merge(s_toTest, by="SampleID") %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(Taxa) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  #select(Taxa, term, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(summaries_df$fdr<0.05))
+
+
+```
+
+
+```{r eval=F}
+props_toTest %>%
+  merge(s_toTest, by="SampleID") %>%
+  
+  filter(Taxa %in% c("Firmicutes Lactobacillus johnsonii", "Firmicutes Faecalibacterium prausnitzii", 
+                     "Firmicutes Streptococcus infantarius", "Firmicutes Anaerostipes hadrus",
+                     "Bacteroidetes Bacteroidales", "Firmicutes Lactobacillus reuteri")) %>%
+  mutate(Taxa = gsub("Firmicutes ", "", Taxa)) %>%
+  mutate(Taxa = gsub("Bacteroidetes ", "", Taxa)) %>%
+  
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  ggplot(aes(x=study_group_label, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_line(aes(group=SubjectID, color=SubjectID)) +
+    geom_point(aes(color=SubjectID)) +
+    scale_color_manual(values=ann_colors$SubjectID) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=3) +
+    scale_y_continuous(labels=scales:::percent) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank(),
+      aspect.ratio = 1
+      #axis.text.x=element_text(angle=90, hjust=1, vjust=0.5)
+    ) +
+    guides(color=F) +
+    labs(x="", color="Subject ID",
+         y="Relative abundance")
+
+#ggsave("Fig5_RelativeAbundance.pdf", height=5.5, width=8, useDingbats=F)
+```
+
+
+
+### Test to look for early recovery signature
+
+Only the SIV d0, d35 and 3 month time points were selected for the tests.
+
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- props_toTest %>%
+  merge(s_toTest, by="SampleID") %>%
+  filter(study_group %in% c("SIV.d0", "SIV.d35", "SIV.ART.3mos")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(props_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(Taxa) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  #select(Taxa, contrast, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2)#, emphasize.strong.rows = which(summaries_df$fdr<0.05))
+
+
+```
+
+
+### Test to look for late recovery signature
+
+Only the ART 3mo, 8mo, 1yr and 21 mo time points were selected for the tests. We are looking for a linear increase in abundance as the subjects progress through time.
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- props_toTest %>%
+  merge(s_toTest, by="SampleID") %>%
+  filter(study_group %in% c("SIV.ART.3mo", "SIV.ART.8mo", "SIV.ART.1yr", "SIV.ART.21mo")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(props_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(Taxa) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  #select(Taxa, contrast, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2)#, emphasize.strong.rows = which(.$fdr<0.05 & .$term == "study group.L"))
+
+
+```
+
+
+
+## Butyrate producing genes
+
+
+```{r}
+but <- read.delim(butyrate_file_fp, sep='\t')
+
+gene_counts_toTest <- but %>%
+  filter(SampleID %in% s_toTest$SampleID) %>%
+  
+  mutate(props = props + min(filter(but, props>0)$props) / 10) %>%
+  mutate(props_logit =  log(props/(1-props))) %>%
+  
+  group_by(geneID, database, pathway_name) %>%
+  mutate(perc_present = mean(count>0)) %>%
+  ungroup() %>%
+  filter(perc_present > 0.25) %>%
+  
+  right_join(s_toTest, by="SampleID")
+
+```
+
+
+```{r fig.height=8, fig.width=8}
+gene_counts_toTest %>%
+  mutate(pathway_name = fct_recode(pathway_name, `Amino\nbutyrate`="4aminobutyrate")) %>%
+  ggplot(aes(x=SampleID, y=geneID)) +
+    geom_tile(aes(fill = props), colour = "white") +
+    scale_fill_viridis(trans="log10", labels = scales:::percent) +
+    facet_grid(pathway_name~study_group_label, scale="free", space="free") +
+    theme_bw() +
+    scale_y_discrete(expand = c(0,0)) +
+      theme(
+        strip.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        aspect.ratio = 1
+      ) +
+      labs(
+        x="Samples",
+        y="", fill="Relative\nabundance"
+      )
+#ggsave("Fig6_but_siv.pdf", height=5, width=8, useDingbats=F)
+```
+
+Linear mixed effects models were used on logit transformed relative abundances to estimate the difference between study groups. The general study group term is tested first followed by post-hoc tests. Multiple tests have been corrected for false discovery rate using the Benjamini-Hochberg method. 
+
+```{r}
+form1 <- "props_logit ~ study_group"
+
+summaries_df <- gene_counts_toTest %>%
+  group_by(geneID, pathway_name) %>%
+  do(tidy_lmer2(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit), "study_group")) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", contrast)) %>%
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) 
+
+
+summaries_df %>%
+  select(geneID, contrast, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+The same test was repeated with ordered factors to determine linear increase across the study groups (pre < SIV < SIV.ART).
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- gene_counts_toTest %>%
+  group_by(geneID) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) 
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+```
+
+
+### Test to look for early recovery signature
+
+Only the SIV d0, d35 and 3 month time points were selected for the tests.
+
+These tests look for a linear or quadratic change across time. A significant p value in quadratic term (Q) would mean a change in the SIV group and a rebound in the ART group.
+
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- gene_counts_toTest %>%
+  filter(study_group %in% c("SIV.d0", "SIV.d35", "SIV.ART.3mos")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(gene_counts_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(geneID) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(summaries_df$fdr<0.05))
+
+
+```
+
+
+
+
+### Test to look for late recovery signature
+
+Only the ART 3mo, 8mo, 1yr and 21 mo time points were selected for the tests. We are looking for a linear increase in abundance as the subjects progress through time.
+
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- gene_counts_toTest %>%
+  filter(study_group %in% c("SIV.ART.3mo", "SIV.ART.8mo", "SIV.ART.1yr", "SIV.ART.21mo")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(gene_counts_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(geneID) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+Linear mixed effects models were used to compare time points. For an early recovery signature, we are looking for a decrease at SIV time point and an increase in ART time point, or vica versa.  
+
+
+
+```{r}
+form1 <- "props_logit ~ study_group"
+
+summaries_df <- gene_counts_toTest %>%
+  filter(study_group %in% c("SIV.ART.3mo", "SIV.ART.8mo", "SIV.ART.1yr", "SIV.ART.21mo")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(gene_counts_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(geneID) %>%
+  do(tidy_lmer2(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit), "study_group")) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", contrast)) %>%
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) 
+
+
+summaries_df %>%
+  select(geneID, contrast, df, estimate, SE, p.value, fdr) %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+## Plasma cytokines and leaky gut biomarkers
+
+```{r}
+s_toTest <- s %>%
+  mutate(study_day = factor(study_day, levels=c("d0", "d35", "3mo", "8mo", "1yr", "21mo"))) %>%
+  mutate(study_group = interaction(study_group_simple, study_day)) %>%
+  droplevels() %>%
+  
+  mutate(study_group_linear = factor(study_group, ordered=T)) %>%
+  mutate(study_group_label = fct_relabel(study_group, function(x) gsub("\\.", "\n", x)))
+
+pander(table(s_toTest$SubjectID, s_toTest$study_group), split.table=Inf, digits=2)
+
+
+cytokine_data_toTest <- merge(s_toTest, cytokine_data, by="SampleID") 
+
+ann_colors <- list(
+  study_group = setNames(viridis(7, end=0.8), levels(s_toTest$study_group)),
+  study_group_label = setNames(viridis(7, end=0.8), levels(s_toTest$study_group_label)),
+  SubjectID = setNames(brewer.pal(6, "Set2"), unique(s_toTest$SubjectID))
+)
+```
+
+The same test was repeated with ordered factors to determine linear increase across the study groups (pre < SIV < SIV.ART).
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- gene_counts_toTest %>%
+  group_by(geneID) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) 
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+### Test to look for early recovery signature
+
+Only the SIV d0, d35 and 3 month time points were selected for the tests.
+
+
+```{r}
+form1 <- "props_logit ~ study_group_linear"
+
+summaries_df <- gene_counts_toTest %>%
+  filter(study_group %in% c("SIV.d0", "SIV.d35", "SIV.ART.3mos")) %>%
+  droplevels() %>%
+  
+  mutate(props = props + min(filter(gene_counts_toTest, props>0)$props) / 10) %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  group_by(geneID) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), data=., random=~1|SubjectID, na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  filter(p.value<0.05) %>%
+  
+  mutate(term = sub("study_group_linear", "study group", term))
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(summaries_df$fdr<0.05))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+### Correlation between bacterial abundances and cytokines
+
+Bacterial levels and cytokine levels were correlated to find patterns of host-microbe interactions (linear mixed effects models).
+
+```{r}
+met_toTest <- summed_props[, s_toTest$SampleID] %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  group_by(Taxa) %>%
+  mutate(perc_present = sum(props > 0)/n()) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  mutate(props_logit = log(props/(1-props))) %>%
+  filter(mean_prop > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  merge(cytokine_data_toTest, by="SampleID")
+
+summaries_df <- met_toTest %>%
+  group_by(Cytokine, Taxa, region) %>%
+  do(tidy_lmer(nlme::lme(props_logit ~ value, random=~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+  
+
+summaries_df %>%
+  filter(p.value<0.05) %>%
+  select(-one_of(c("method", "alternative"))) %>%
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  pander(digits=2, split.table=Inf)
+
+```
+
+```{r}
+met_toTest %>%
+  filter(region == "Plasma") %>%
+  filter(Taxa %in% "Firmicutes Streptococcus lutetiensis") %>%
+  filter(Cytokine %in% "TNF.alpha") %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig7A_Plasma_Strep_lutetuensis.pdf", height=3, width=6)
+```
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Plasma") %>%
+  filter(Taxa %in% "Firmicutes Streptococcus infantarius") %>%
+  filter(Cytokine %in% c("IP.10", "GM.CSF")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig7A_Plasma_Strep_infantarius.pdf", height=3, width=10)
+```
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Plasma") %>%
+  filter(Taxa %in% "Firmicutes  [Eubacterium] rectale") %>%
+  filter(Cytokine %in% c("IL.6", "G.CSF")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig7A_Plasma_Eubacterium_rectale.pdf", height=3, width=10)
+```
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Plasma") %>%
+  filter(Taxa %in% "Spirochaetes Treponema succinifaciens") %>%
+  filter(Cytokine %in% c("IL.6", "G.CSF")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig7B_Plasma_Treponema_succinifaciens.pdf", height=3, width=10)
+```
+
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Plasma") %>%
+  filter(Taxa %in% "Firmicutes Faecalibacterium prausnitzii") %>%
+  filter(Cytokine %in% c("I.TAC", "MIG", "IL.1RA")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig7B_Plasma_Faecalibacterium_praustnitzii.pdf", height=3, width=12)
+```
+
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Leaky gut biomarkers in plasma") %>%
+  filter(Taxa %in% "Firmicutes  [Eubacterium] rectale") %>%
+  filter(Cytokine %in% c("IFABP", "LBP", "sCD14")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig8A_LeakyGut_Eubacterium_rectale.pdf", height=3, width=12)
+```
+
+
+```{r}
+met_toTest %>%
+  filter(region == "Leaky gut biomarkers in plasma") %>%
+  filter(Taxa %in% "Spirochaetes Treponema succinifaciens") %>%
+  filter(Cytokine %in% c("IFABP", "LBP", "sCD14")) %>%
+  ggplot(aes(x=value, y=props)) +
+    geom_point(aes(color=study_group)) +
+    geom_smooth(method="lm", color="black", size=0.5) +
+    facet_wrap(~Cytokine, scales="free", ncol=3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      legend.position="bottom",
+      aspect.ratio = 0.7
+    ) +
+    labs(
+      x="Cytokine levels", color="",
+      y="Relative abundance"
+    )
+#ggsave("Fig8B_LeakyGut_Treponema_succinifaciens.pdf", height=3, width=12)
+```
